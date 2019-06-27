@@ -148,6 +148,11 @@ if __name__ == '__main__':
     parser.add_argument('--save_path', type=str, default='ckpt')
     parser.add_argument('--trans_cache', type=str,
                         default=None)
+    parser.add_argument('--log_types', type=str, nargs='+', 
+                        default=['tensorboard', 'pkl'],
+                        help='Types of log writing interfaces to use: '
+                             '(1) tensorboard, (2) pkl (Def: tensorboard '
+                             'and pkl).')
     parser.add_argument('--num_workers', type=int, default=2)
     parser.add_argument('--seed', type=int, default=2)
     parser.add_argument('--no-cuda', action='store_true', default=False)
@@ -189,6 +194,9 @@ if __name__ == '__main__':
                         help='Do VQ quantization of enc output (Def: False).')
     parser.add_argument('--preload_wav', action='store_true', default=False,
                         help='Preload wav files in Dataset (Def: False).')
+    parser.add_argument('--cache_on_load', action='store_true', default=False,
+                        help='Argument to activate cache loading on the fly '
+                             'for the wav files in datasets (Def: False).')
 
     opts = parser.parse_args()
     if opts.net_cfg is None:
