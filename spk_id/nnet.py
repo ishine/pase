@@ -261,28 +261,35 @@ def main(opts):
         # compute total samples dur
         beg_t = timeit.default_timer()
         tr_durs, sr = compute_utterances_durs(tr_files_, opts.data_root)
-        va_durs, _ = compute_utterances_durs(va_files, opts.data_root)
         train_dur = np.sum(tr_durs)
-        valid_dur = np.sum(va_durs)
         end_t = timeit.default_timer()
-        print('Read tr/va {:.1f} s/{:.1f} s in {} s'.format(train_dur / sr,
-                                                            valid_dur / sr,
-                                                            end_t - beg_t))
+        if len(va_files) > 0:
+            va_durs, _ = compute_utterances_durs(va_files, opts.data_root)
+            valid_dur = np.sum(va_durs)
+            print('Read tr/va {:.1f} s/{:.1f} s in {} s'.format(train_dur / sr,
+                                                                valid_dur / sr,
+                                                                end_t - beg_t))
+        else:
+            print('Read tr {:.1f} s in {} s'.format(train_dur / sr,
+                                                    end_t - beg_t))
+            opts.sched_mode='step'
         # Build Datasets
         dset = LibriSpkIDDataset(opts.data_root,
                                  tr_files_, spk2idx)
-        va_dset = LibriSpkIDDataset(opts.data_root,
-                                    va_files, spk2idx)
+        if len(va_files) > 0:
+            va_dset = LibriSpkIDDataset(opts.data_root,
+                                        va_files, spk2idx)
         cc = WavCollater(max_len=opts.max_len)
         #cc_vate = WavCollater(max_len=None)
         cc_vate = cc
         dloader = DataLoader(dset, batch_size=opts.batch_size, collate_fn=cc,
-                             shuffle=True)
-        va_dloader = DataLoader(va_dset, batch_size=opts.batch_size,
-                                collate_fn=cc_vate,
-                                shuffle=False)
+                             shuffle=True, num_workers=opts.num_workers)
+        if len(va_files) > 0:
+            va_dloader = DataLoader(va_dset, batch_size=opts.batch_size,
+                                    collate_fn=cc_vate,
+                                    shuffle=False)
+            va_bpe = (valid_dur // opts.max_len) // opts.batch_size
         tr_bpe = (train_dur // opts.max_len) // opts.batch_size
-        va_bpe = (valid_dur // opts.max_len) // opts.batch_size
         if opts.test_guia is not None:
             te_dset = LibriSpkIDDataset(opts.data_root,
                                         te_files, spk2idx)
@@ -312,20 +319,22 @@ def main(opts):
         for epoch in range(1, opts.epoch + 1):
             train_epoch(dloader, model, opt, epoch, opts.log_freq, writer=writer,
                         device=device, bpe=tr_bpe)
-            eloss, eacc = eval_epoch(va_dloader, model, epoch, opts.log_freq,
-                                     writer=writer, device=device, bpe=va_bpe,
-                                     key='valid')
-            if opts.sched_mode == 'step':
+            if len(va_files) > 0:
+                eloss, eacc = eval_epoch(va_dloader, model, epoch, opts.log_freq,
+                                         writer=writer, device=device, bpe=va_bpe,
+                                         key='valid')
+            if opts.sched_mode == 'step' or len(va_files) == 0:
                 sched.step()
             else:
                 sched.step(eacc)
-            if eacc > best_val_acc:
-                print('*' * 40)
-                print('New best val acc: {:.3f} => {:.3f}.'
-                      ''.format(best_val_acc, eacc))
-                print('*' * 40)
-                best_val_acc = eacc
-                best_val = True
+            if len(va_files) > 0:
+                if eacc > best_val_acc:
+                    print('*' * 40)
+                    print('New best val acc: {:.3f} => {:.3f}.'
+                          ''.format(best_val_acc, eacc))
+                    print('*' * 40)
+                    best_val_acc = eacc
+                    best_val = True
             model.save(opts.save_path, epoch - 1, best_val=best_val)
             best_val = False
             if opts.test_guia is not None:
@@ -395,7 +404,7 @@ def main(opts):
                                          ''.format(te_files[bidx - 1],
                                                    acc * 100,
                                                    100 - (acc * 100)))
-                    teacc.append(accuracy(Y_, Y))
+                    teacc.append(accuracy(Y_, Y).item())
                     teloss.append(loss.item())
                     end_t = timeit.default_timer()
                     timings.append(end_t - beg_t)
@@ -436,12 +445,12 @@ def train_epoch(dloader_, model, opt, epoch, log_freq=1, writer=None,
     timings = []
     beg_t = timeit.default_timer()
     #for bidx, batch in enumerate(dloader_, start=1):
-    iterator = iter(dloader)
+    iterator = iter(dloader_)
     for bidx in range(1, bpe + 1):
         try:
             batch = next(iterator)
         except StopIteration:
-            iterator = iter(dloader)
+            iterator = iter(dloader_)
             batch = next(iterator)
         opt.zero_grad()
         X, Y, slens = batch
@@ -484,12 +493,12 @@ def eval_epoch(dloader_, model, epoch, log_freq=1, writer=None, device='cpu',
         timings = []
         beg_t = timeit.default_timer()
         #for bidx, batch in enumerate(dloader_, start=1):
-        iterator = iter(dloader)
+        iterator = iter(dloader_)
         for bidx in range(1, bpe + 1):
             try:
                 batch = next(iterator)
             except StopIteration:
-                iterator = iter(dloader)
+                iterator = iter(dloader_)
                 batch = next(iterator)
             X, Y, slens = batch
             #X = X.transpose(1, 2)
@@ -532,6 +541,7 @@ if __name__ == '__main__':
                         default=None)
     parser.add_argument('--save_path', type=str, default='ckpt_nnet')
     parser.add_argument('--data_root', type=str, default=None)
+    parser.add_argument('--num_workers', type=int, default=2)
     parser.add_argument('--batch_size', type=int, default=100)
     parser.add_argument('--train_guia', type=str, default=None)
     parser.add_argument('--test_guia', type=str, default=None)
