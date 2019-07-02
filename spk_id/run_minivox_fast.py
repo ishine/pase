@@ -6,9 +6,11 @@
 # This system is not designed for an extensive evaluation of PASE features, but mainly for quickly monitoring the performance of PASE during the self-supervised training phase.
 # The results are printed in standard output and within the text file specified in the last argument.
 
-# To run it:
-# python run_minivox_fast.py ../cfg/PASE.cfg ../PASE.ckpt /home/mirco/Dataset/minivox  minivox_exp.res
+# To run the speaker recognition exp on minivox celeb:
+# python run_minivox_fast.py ../cfg/PASE.cfg ../PASE.ckpt /scratch/ravanelm/datasets/mini_voxceleb minivox_tr_list.txt minvox_test_list.txt  utt2spk.npy minivox_exp.res
 
+# To run the language id experiment on minivoxforge:
+# python run_minivox_fast.py ../cfg/PASE.cfg ../PASE.ckpt /scratch/ravanelm/datasets/mini_voxforge/ minivoxforge_tr_list.txt minivoxforge_test_list.txt  utt2lang.npy  minivoxforge.res
 
 import sys
 from neural_networks import MLP,context_window
@@ -20,21 +22,29 @@ from pase.models.frontend import wf_builder
 # from waveminionet.models.frontend import wf_builder #old models
 import soundfile as sf
 
+def get_nspk(utt2spk):
+    lab_list = []
+    for utt, spk in utt2spk.items():
+        lab_list.append(int(spk))
+
+    return max(lab_list)+1
+
 
 pase_cfg=sys.argv[1] # e.g, '../cfg/PASE.cfg'
 pase_model=sys.argv[2] # e.g, '../PASE.ckpt'
 data_folder=sys.argv[3] # eg. '/home/mirco/Dataset/mini_voxceleb minivox'
-output_file=sys.argv[4] # e.g., 'minivox_exp.res'
+tr_lst_file=sys.argv[4] # e.g., 'minivox_tr_list.txt'
+dev_lst_file=sys.argv[5] # e.g., 'minvox_test_list.txt'
+lab_file=sys.argv[6] # e.g., 'minvox_test_list.txt'
+output_file=sys.argv[7] # e.g., 
 
 
-# Label files for TIMIT
-lab_file='utt2spk.npy'
+lab=np.load(lab_file, allow_pickle=True).item()
 
-lab=np.load(lab_file).item()
+# get number of speakers
 
-# File list for TIMIT
-tr_lst_file='minivox_tr_list.txt'
-dev_lst_file='minvox_test_list.txt'
+nspk=get_nspk(lab)
+
 
 tr_lst = [line.rstrip('\n') for line in open(tr_lst_file)]
 dev_lst = [line.rstrip('\n') for line in open(dev_lst_file)]
@@ -43,14 +53,14 @@ dev_lst = [line.rstrip('\n') for line in open(dev_lst_file)]
 N_epochs=24
 seed=1234
 batch_size=128
-halving_factor=0.5
+halving_factor=1.0
 lr=0.12
 left=0
 right=0
 
 # Neural network parameters
 options={}
-options['dnn_lay']='1024,40'
+options['dnn_lay']='1024,'+str(nspk)
 options['dnn_drop']='0.15,0.0'
 options['dnn_use_batchnorm']='False,False'
 options['dnn_use_laynorm']='True,False'
@@ -74,7 +84,7 @@ pase.eval()
 print("Waveform reading...")
 fea={}
 for wav_file in tr_lst:
-    [signal, fs] = sf.read(data_folder+'/'+wav_file)
+    [signal, fs] = sf.read(data_folder+'/train/'+wav_file)
     signal=signal/np.max(np.abs(signal))
     signal = signal.astype(np.float32)
     
@@ -85,7 +95,7 @@ for wav_file in tr_lst:
 # reading the dev signals
 fea_dev={}
 for wav_file in dev_lst:
-    [signal, fs] = sf.read(data_folder+'/'+wav_file)
+    [signal, fs] = sf.read(data_folder+'/test/'+wav_file)
     signal=signal/np.max(np.abs(signal))
     fea_id=wav_file.split('/')[-1]
     fea_dev[fea_id]=torch.from_numpy(signal).float().to(device).view(1,1,-1)
@@ -271,10 +281,10 @@ for ep in range(N_epochs):
             optimizer.param_groups[0]['lr']=lr
 
 
-print('BEST ERR=%f' %(min(err_dev_snt_history)))
-print('BEST ACC=%f' %(1-min(err_dev_snt_history)))
-text_file.write('BEST_ERR=%f\n' %(min(err_dev_snt_history)))
-text_file.write('BEST_ACC=%f\n' %(1-min(err_dev_snt_history)))
+print('BEST ERR=%f' %(min(err_dev_fr_history)))
+print('BEST ACC=%f' %(1-min(err_dev_fr_history)))
+text_file.write('BEST_ERR=%f\n' %(min(err_dev_fr_history)))
+text_file.write('BEST_ACC=%f\n' %(1-min(err_dev_fr_history)))
 text_file.close()
     
     
