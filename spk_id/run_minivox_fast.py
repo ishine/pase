@@ -7,12 +7,13 @@
 # The results are printed in standard output and within the text file specified in the last argument.
 
 # To run the speaker recognition exp on minivox celeb:
-# python run_minivox_fast.py ../cfg/PASE.cfg ../PASE.ckpt /scratch/ravanelm/datasets/mini_voxceleb minivox_tr_list.txt minvox_test_list.txt  utt2spk.npy minivox_exp.res
+# python run_minivox_fast.py ../cfg/PASE.cfg ../PASE.ckpt /scratch/ravanelm/datasets/minivoxceleb_40spk/ minivoxceleb_40spk/minivox_tr_list.txt minivoxceleb_40spk/minivox_test_list.txt  minivoxceleb_40spk/utt2spk.npy  minivox_fina.res
 
 # To run the language id experiment on minivoxforge:
 # python run_minivox_fast.py ../cfg/PASE.cfg ../PASE.ckpt /scratch/ravanelm/datasets/mini_voxforge/ minivoxforge_tr_list.txt minivoxforge_test_list.txt  utt2lang.npy  minivoxforge.res
 
 import sys
+import os
 from neural_networks import MLP,context_window
 import torch
 import numpy as np
@@ -21,6 +22,20 @@ import torch.optim as optim
 from pase.models.frontend import wf_builder
 # from waveminionet.models.frontend import wf_builder #old models
 import soundfile as sf
+
+def get_freer_gpu(trials=10):
+	for j in range(trials):
+		os.system('nvidia-smi -q -d Memory |grep -A4 GPU|grep Free >tmp')
+		memory_available = [int(x.split()[2]) for x in open('tmp', 'r').readlines()]
+		dev_ = torch.device('cuda:'+str(np.argmax(memory_available)))
+		try:
+			a = torch.rand(1).cuda(dev_)
+			return dev_
+		except:
+			pass
+
+	print('NO GPU AVAILABLE!!!')
+	exit(1)
 
 def get_nspk(utt2spk):
     lab_list = []
@@ -68,7 +83,7 @@ options['dnn_use_laynorm_inp']='True'
 options['dnn_use_batchnorm_inp']='False'
 options['dnn_act']='relu,softmax'
 
-device='cuda'
+device=get_freer_gpu()
 
 
 # output file creation
