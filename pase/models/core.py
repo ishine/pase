@@ -1,7 +1,9 @@
 from .minions import *
 from ..losses import *
+from ..utils import AuxiliarSuperviser
 from ..log import *
 #from tensorboardX import SummaryWriter
+import soundfile as sf
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 import numpy as np
@@ -15,7 +17,7 @@ class Waveminionet(Model):
     def __init__(self, frontend=None, frontend_cfg=None,
                  minions_cfg=None, z_minion=True,
                  z_cfg=None, adv_loss='BCE',
-                 num_devices=1, pretrained_ckpt=None,
+                 num_devices=1, pretrained_ckpts=None,
                  name='Waveminionet'):
         super().__init__(name=name)
         # augmented wav processing net
@@ -77,8 +79,8 @@ class Waveminionet(Model):
                 }
             self.z_minion = minion_maker(z_cfg)
             self.z_minion.loss.register_DNet(self.z_minion)
-        if pretrained_ckpt is not None:
-            self.load_pretrained(pretrained_ckpt, load_last=True)
+        if pretrained_ckpts is not None:
+            self.load_checkpoints(pretrained_ckpts)
         if num_devices > 1:
             self.frontend_dp = nn.DataParallel(self.frontend)
             self.minions_dp = nn.ModuleList([nn.DataParallel(m) for m in \
@@ -106,11 +108,48 @@ class Waveminionet(Model):
         else:
             return torch.cat((x, skip), dim=1)
 
+    def load_checkpoints(self, load_path):
+        # create each savers first for all net components
+        savers = [Saver(self.frontend, load_path, 
+                        prefix='PASE-')]
+        if hasattr(self, 'z_minion'):
+            savers.append(Saver(self.z_minion, load_path,
+                           prefix='Zminion-'))
+        for mi, minion in enumerate(self.minions, start=1):
+            savers.append(Saver(minion, load_path, 
+                                prefix='M-{}-'.format(minion.name)))
+        # now load each ckpt found
+        giters = 0
+        for saver in savers:
+            # try loading all savers last state if not forbidden is active
+            try:
+                state = saver.read_latest_checkpoint()
+                giter_ = saver.load_ckpt_step(state)
+                print('giter_ found: ', giter_)
+                # assert all ckpts happened at last same step
+                if giters == 0:
+                    giters = giter_
+                else:
+                    assert giters == giter_, giter_
+                saver.load_pretrained_ckpt(os.path.join(load_path,
+                                                        'weights_' + state), 
+                                           load_last=True)
+            except TypeError:
+                break
+
+
     def train_(self, dloader, cfg, device='cpu', va_dloader=None):
         epoch = cfg['epoch']
         bsize = cfg['batch_size']
         save_path = cfg['save_path']
         log_freq = cfg['log_freq']
+        sup_freq = cfg['sup_freq']
+        if cfg['sup_exec'] is not None:
+            aux_save_path = os.path.join(cfg['save_path'],
+                                         'sup_aux')
+            if not os.path.exists(aux_save_path):
+                os.makedirs(aux_save_path)
+            self.aux_sup = AuxiliarSuperviser(cfg['sup_exec'], aux_save_path)
         # Adversarial auto-encoder hyperparams
         warmup_epoch = cfg['warmup']
         zinit_weight = cfg['zinit_weight']
@@ -252,7 +291,6 @@ class Waveminionet(Model):
                     if self.vq:
                         vq_loss, fe_Q, \
                         vq_pp, vq_idx = frontend(triplet.to(device))
-                        vq_loss = frontend.vq_loss_weight * vq_loss
                         fe_h['triplet'] = fe_Q
                     else:
                         fe_h['triplet'] = frontend(triplet.to(device))
@@ -332,10 +370,10 @@ class Waveminionet(Model):
                     greal_loss = torch.zeros(1)
                 global_step += 1
 
-                t_loss = None
+                t_loss = torch.zeros(1).to(device)
                 if self.vq:
                     # Backprop VQ related stuff
-                    t_loss = vq_loss
+                    t_loss += vq_loss
                 # backprop time
                 if rndmin_train:
                     min_names = list(min_h.keys())
@@ -366,10 +404,7 @@ class Waveminionet(Model):
                         lweight = minion.loss_weight
                         loss = minion.loss(y_, y_lab)
                         loss = lweight * loss
-                        try:
-                            t_loss += loss
-                        except TypeError:
-                            t_loss = loss
+                        t_loss += loss
                         #loss.backward(retain_graph=True)
                         if min_name not in min_loss:
                             min_loss[min_name] = []
@@ -424,12 +459,13 @@ class Waveminionet(Model):
                                              bins='sturges',
                                              global_step=global_step)
                     if self.vq:
-                        print('VQLoss: {:.2f}, VQPP: '
-                              '{:.2f}'.format(vq_loss.item(), vq_pp.item()))
+                        print('VQLoss: {:.3f}, VQPP: '
+                              '{:.3f}'.format(vq_loss.item(), vq_pp.item()))
                         writer.add_scalar('train/vq_loss', vq_loss.item(),
                                           global_step=global_step)
                         writer.add_scalar('train/vq_pp', vq_pp.item(),
                                           global_step=global_step)
+                    print('Total summed loss: {:.3f}'.format(t_loss.item()))
 
 
                     print('Mean batch time: {:.3f} s'.format(np.mean(timings)))
@@ -439,6 +475,7 @@ class Waveminionet(Model):
                 eloss = self.eval_(va_dloader, bsize, va_bpe, log_freq=log_freq,
                                    epoch_idx=epoch_,
                                    writer=writer, device=device)
+
                 """
                 if lrdecay > 0:
                     # update frontend lr
@@ -462,15 +499,20 @@ class Waveminionet(Model):
                     minscheds[minion.name].step()
 
             # Save plain frontend weights 
-            torch.save(self.frontend.state_dict(),
-                       os.path.join(save_path,
-                                    'FE_e{}.ckpt'.format(epoch_)))
+            fe_path = os.path.join(save_path, 
+                                   'FE_e{}.ckpt'.format(epoch_))
+            torch.save(self.frontend.state_dict(), fe_path)
             # Run through each saver to save model and optimizer
             for saver in savers:
                 saver.save(saver.prefix[:-1], global_step)
             #torch.save(self.state_dict(),
             #           os.path.join(save_path,
             #                        'fullmodel_e{}.ckpt'.format(epoch_)))
+            # TODO: sup. aux losses
+            if (epoch_ + 1 ) % sup_freq == 0 or \
+               (epoch_ + 1) >= (epoch_beg + epoch):
+                if hasattr(self, 'aux_sup'):
+                    self.aux_sup(epoch_, fe_path, cfg['fe_cfg'])
 
     def eval_(self, dloader, batch_size, bpe, log_freq,
               epoch_idx=0, writer=None, device='cpu'):

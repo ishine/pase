@@ -7,7 +7,6 @@ import math
 import soundfile as sf
 import json
 import tqdm
-import librosa
 import pickle
 import os
 import random
@@ -437,7 +436,9 @@ class LibriSpeechSegTupleWavDataset(PairWavDataset):
 
         if self.distortion_transforms:
             pkg = self.distortion_transforms(pkg)
-
+        #sf.write('/tmp/ex_chunk.wav', pkg['chunk'], 16000)
+        #sf.write('/tmp/ex_cchunk.wav', pkg['cchunk'], 16000)
+        #raise NotImplementedError
         if self.transform is None:
             # if no transforms happened do not send a package
             return pkg['chunk'], pkg['raw_rand']
