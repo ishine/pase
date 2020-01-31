@@ -11,6 +11,11 @@
 #
 # To run the experiment with the noisy and reverberated version of TIMIT, just change the data folder with the one containing TIMIT_rev_noise.
 
+import warnings
+warnings.filterwarnings("ignore")
+
+import librosa
+
 import os
 import sys
 from neural_networks import MLP,context_window
@@ -23,6 +28,11 @@ from pase.models.frontend import wf_builder
 # from waveminionet.models.frontend import wf_builder #old models
 import soundfile as sf
 import os
+import json
+# import pase.models as models
+# import models.WorkerScheduler
+from pase.models.WorkerScheduler.encoder import *
+
 
 def get_freer_gpu(trials=10):
     for j in range(trials):
@@ -60,7 +70,7 @@ N_epochs=24
 seed=1234
 batch_size=128
 halving_factor=0.5
-lr=0.12
+lr=0.0012
 left=1
 right=1
 
@@ -74,14 +84,15 @@ options['dnn_use_laynorm_inp']='True'
 options['dnn_use_batchnorm_inp']='False'
 options['dnn_act']='relu,softmax'
 
-device=get_freer_gpu()
+#device=0 #get_freer_gpu()
+device='cuda'
 
 
 # folder creation
 text_file=open(output_file, "w")
 
 # Loading pase
-pase = wf_builder(pase_cfg)
+pase =wf_builder(pase_cfg)
 pase.load_pretrained(pase_model, load_last=True, verbose=False)
 pase.to(device)
 pase.eval()
@@ -95,7 +106,7 @@ for wav_file in tr_lst:
     signal = signal.astype(np.float32)
     
     fea_id=wav_file.split('/')[-2]+'_'+wav_file.split('/')[-1].split('.')[0]
-    fea[fea_id]=torch.from_numpy(signal).float().to(device).view(1,1,-1)
+    fea[fea_id]=torch.from_numpy(signal).float().view(1,1,-1)
 
 
 # reading the dev signals
@@ -104,23 +115,30 @@ for wav_file in dev_lst:
     [signal, fs] = sf.read(data_folder+'/'+wav_file)
     signal=signal/np.max(np.abs(signal))
     fea_id=wav_file.split('/')[-2]+'_'+wav_file.split('/')[-1].split('.')[0]
-    fea_dev[fea_id]=torch.from_numpy(signal).float().to(device).view(1,1,-1)
+    fea_dev[fea_id]=torch.from_numpy(signal).float().view(1,1,-1)
+
 
 # Computing pase features for training
 print('Computing PASE features...')
-fea_pase={}
-for snt_id in fea.keys():
-    pase.eval()
-    fea_pase[snt_id]=pase(fea[snt_id]).to('cpu').detach()
-    fea_pase[snt_id]=fea_pase[snt_id].view(fea_pase[snt_id].shape[1],fea_pase[snt_id].shape[2]).transpose(0,1)
+with torch.no_grad():
+    fea_pase={}
+    for wi, snt_id in enumerate(fea.keys()):
+        #pase.eval()
+        fea_pase[snt_id]=pase(fea[snt_id].to(device), device=device,mode='avg_norm').to('cpu').detach()
+        fea_pase[snt_id]=fea_pase[snt_id].view(fea_pase[snt_id].shape[1],fea_pase[snt_id].shape[2]).transpose(0,1)
+        print('Processed training utterance {}/{} features'.format(wi + 1,
+                                                                   len(fea.keys())))
 
 inp_dim=fea_pase[snt_id].shape[1]*(left+right+1)
 
-# Computing pase features for test
-fea_pase_dev={}
-for snt_id in fea_dev.keys():
-    fea_pase_dev[snt_id]=pase(fea_dev[snt_id]).to('cpu').detach()
-    fea_pase_dev[snt_id]=fea_pase_dev[snt_id].view(fea_pase_dev[snt_id].shape[1],fea_pase_dev[snt_id].shape[2]).transpose(0,1)
+with torch.no_grad():
+    # Computing pase features for test
+    fea_pase_dev={}
+    for wi, snt_id in enumerate(fea_dev.keys()):
+        fea_pase_dev[snt_id]=pase(fea_dev[snt_id].to(device), device=device, mode='avg_norm').to('cpu').detach()
+        fea_pase_dev[snt_id]=fea_pase_dev[snt_id].view(fea_pase_dev[snt_id].shape[1],fea_pase_dev[snt_id].shape[2]).transpose(0,1)
+        print('Processed test utterance {}/{} features'.format(wi + 1,
+                                                               len(fea_dev.keys())))
 
   
 # Label file reading

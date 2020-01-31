@@ -2,7 +2,9 @@ import torch
 import torch.nn as nn
 import math
 import torch.nn.functional as F
+from torch.distributions import Binomial
 from torch.nn.utils.spectral_norm import spectral_norm
+from torch.nn.utils.weight_norm import weight_norm
 import numpy as np
 import json
 import os
@@ -10,6 +12,67 @@ try:
     from torchqrnn import QRNN
 except ImportError:
     QRNN = None
+
+def format_frontend_chunk(batch, device='cpu'):
+    if type(batch) == dict:
+        if 'chunk_ctxt' and 'chunk_rand' in batch:
+            keys = ['chunk', 'chunk_ctxt', 'chunk_rand', 'cchunk']
+            # cluster all 'chunk's, including possible 'cchunk'
+            batches = [batch[k] for k in keys if k in batch]
+            x = torch.cat(batches, dim=0).to(device)
+            # store the number of batches condensed as format
+            data_fmt = len(batches)
+        else:
+            x = batch['chunk'].to(device)
+            data_fmt = 1
+    else:
+        x = batch
+        data_fmt = 0
+    return x, data_fmt
+
+def format_frontend_output(y, data_fmt, mode):
+    #assert data_fmt >= 0
+    if data_fmt > 1:
+        embedding = torch.chunk(y, data_fmt, dim=0)
+        chunk = embedding[0]
+        return embedding, chunk
+    elif data_fmt == 1:
+        chunk = embedding = y
+        return embedding, chunk
+    else:
+        return select_output(y, mode=mode)
+
+def build_rnn_block(in_size, rnn_size, rnn_layers, rnn_type,
+                    bidirectional=True,
+                    dropout=0, use_cuda=True):
+    if (rnn_type.lower() == 'qrnn') and QRNN is not None:
+        if bidirectional:
+            print('WARNING: QRNN ignores bidirectional flag')
+            rnn_size = 2 * rnn_size
+        rnn = QRNN(in_size, rnn_size, rnn_layers, dropout=dropout, window=2,
+                   use_cuda=use_cuda)
+    elif rnn_type.lower() == 'lstm' or rnn_type.lower() == 'gru':
+        rnn = getattr(nn, rnn_type.upper())(in_size, rnn_size, rnn_layers,
+                                            dropout=dropout,
+                                            bidirectional=bidirectional)
+    else:
+        raise TypeError('Unrecognized rnn type: ', rnn_type)
+    return rnn
+        
+def select_output(h, mode=None):
+    if mode == "avg_norm":
+        return h - torch.mean(h, dim=2, keepdim=True)
+    elif mode == "avg_concat":
+        global_avg = torch.mean(h, dim=2, keepdim=True).repeat(1, 1, h.shape[-1])
+        return torch.cat((h, global_avg), dim=1)
+    elif mode == "avg_norm_concat":
+        global_avg = torch.mean(h, dim=2, keepdim=True)
+        h = h - global_avg
+        global_feature = global_avg.repeat(1, 1, h.shape[-1])
+        return torch.cat((h, global_feature), dim=1)
+    else:
+        return h
+
 
 def build_norm_layer(norm_type, param=None, num_feats=None):
     if norm_type == 'bnorm':
@@ -20,6 +83,11 @@ def build_norm_layer(norm_type, param=None, num_feats=None):
     elif norm_type == 'bsnorm':
         spectral_norm(param)
         return nn.BatchNorm1d(num_feats)
+    elif norm_type == 'lnorm':
+        return nn.LayerNorm(num_feats)
+    elif norm_type == 'wnorm':
+        weight_norm(param)
+        return None
     elif norm_type == 'inorm':
         return nn.InstanceNorm1d(num_feats, affine=False)
     elif norm_type == 'affinorm':
@@ -31,7 +99,12 @@ def build_norm_layer(norm_type, param=None, num_feats=None):
 
 def forward_norm(x, norm_layer):
     if norm_layer is not None:
-        return norm_layer(x)
+        if isinstance(norm_layer, nn.LayerNorm):
+            x = x.transpose(1, 2)
+        x = norm_layer(x)
+        if isinstance(norm_layer, nn.LayerNorm):
+            x = x.transpose(1, 2)
+        return x
     else:
         return x
 
@@ -49,6 +122,9 @@ def forward_activation(activation, tensor):
         return y
     else:
         return activation(tensor)
+
+def get_padding(kwidth, dilation):
+    return (kwidth // 2) * dilation
 
 class NeuralBlock(nn.Module):
 
@@ -159,10 +235,9 @@ class Saver(object):
     def load_weights(self):
         save_path = self.save_path
         curr_ckpt = self.read_latest_checkpoint()
-        if curr_ckpt is False:
-            if not os.path.exists(ckpt_path):
-                print('[!] No weights to be loaded')
-                return False
+        if curr_ckpt is None:
+            print('[!] No weights to be loaded')
+            return False
         else:
             st_dict = torch.load(os.path.join(save_path,
                                               'weights_' + \
@@ -211,6 +286,7 @@ class Saver(object):
             print('Current Pt keys: ', len(list(pt_dict.keys())))
             print('Loading matching keys: ', list(pt_dict.keys()))
         if len(pt_dict.keys()) != len(model_dict.keys()):
+            raise ValueError('WARNING: LOADING DIFFERENT NUM OF KEYS')
             print('WARNING: LOADING DIFFERENT NUM OF KEYS')
         # overwrite entries in existing dict
         model_dict.update(pt_dict)
@@ -251,7 +327,7 @@ class Model(NeuralBlock):
             if not hasattr(self, 'saver'):
                 self.saver = Saver(self, save_path, 
                                    optimizer=self.optim,
-                                   prefix=model_name + '-',
+                                   prefix=self.name + '-',
                                    max_ckpts=self.max_ckpts)
             self.saver.load_weights()
         else:
@@ -326,6 +402,157 @@ class GConv1DBlock(NeuralBlock):
         #h = self.act(h)
         return h
 
+class PatternedDropout(nn.Module):
+    def __init__(self, emb_size, p=0.5, 
+                 dropout_mode=['fixed_rand'],
+                 ratio_fixed=None,
+                 range_fixed=None,
+                 drop_whole_channels=False):
+        """Applies a fixed pattern of dropout for the whole training
+        session (i.e applies different only among pre-specified dimensions)
+        """
+        super(PatternedDropout, self).__init__()
+
+        if p < 0 or p > 1:
+            raise ValueError("dropout probability has to be between 0 and 1, "
+                             "but got {}".format(p))
+        self.p = p
+
+        if self.p > 0:
+
+            d_modes = ['std', 'fixed_rand', 'fixed_given']
+            assert dropout_mode in d_modes, (
+                "Expected dropout mode in {}, got {}".format(d_modes, dropout_mode)
+            )
+            self.drop_whole_channels = drop_whole_channels
+            self.dropout_fixed = False
+
+            if dropout_mode == 'fixed_rand':
+
+                self.dropout_fixed = True
+                assert ratio_fixed is not None, (
+                    "{} needs 'ratio_fixed' arg set.".format(dropout_mode)
+                )
+                if ratio_fixed <= 0  or ratio_fixed > 1:
+                    raise ValueError("{} mode needs 'ratio_fixed' to be"\
+                                    " set and in (0, 1) range, got {}"\
+                                    .format(dropout_mode, ratio_fixed))
+                self.ratio_fixed = ratio_fixed
+                self.dropped_dimsize = int(emb_size - emb_size*ratio_fixed)
+                tot_idx = np.arange(emb_size)
+                sel_idx = np.sort(np.random.choice(tot_idx, 
+                                size=self.dropped_dimsize, replace=False))
+
+            elif dropout_mode == 'fixed_given':
+
+                self.dropout_fixed = True
+                if range_fixed is None or \
+                    not isinstance(range_fixed, str) or \
+                    len(range_fixed.split(":")) < 2:
+                    raise ValueError("{} mode needs 'range_dropped' to be"\
+                                    " set (i.e. 10:20)".format(dropout_mode))
+                rng = range_fixed.split(":")
+                beg = int(rng[0])
+                end = int(rng[1])
+                assert beg < end and end <= emb_size, (
+                    "Incorrect range {}".format(range_fixed)
+                )
+                self.dropped_dimsize = int(emb_size - (end -beg))
+                tot_idx = np.arange(emb_size)
+                fixed_idx = np.arange(beg, end, 1)
+                sel_idx = np.setdiff1d(tot_idx, fixed_idx, assume_unique=True)
+
+            if self.dropout_fixed:
+                assert len(sel_idx) > 0, (
+                    "Asked for fixed dropout, but sel_idx {}".format(sel_idx)
+                )
+                print ("Enabled dropout mode: {}. p={}, drop channels {}. Selected indices to apply dropout are: {}"\
+                        .format(dropout_mode, self.p, drop_whole_channels, sel_idx))
+                self.dindexes = torch.LongTensor(sel_idx)
+                self.p = p
+                self.p_scale = 1. / (1. - self.p)
+            else:
+                # notice, it is up to the user to make sure experiments between
+                # fixed dropout and regular one are comparabe w.r.t p (i.e. for
+                # fixed mode we only keep droping a subset of units (i.e. 50%),
+                # thus p is effectively lower when compared to regular dropout)
+                self.p =  p
+                print ("Using std dropout with p={}".format(self.p))
+        else:
+            print ('Dropout at the inputs disabled, as p={}'.format(self.p))
+
+    def forward(self, x):
+
+        if self.p == 0 or not self.training:
+            return x
+
+        if self.dropout_fixed and self.training:
+            self.dindexes = self.dindexes.to(x.device)
+            assert len(x.size()) == 3, (
+                "Expected to get 3 dimensional tensor, got {}"\
+                   .format(len(x.size()))
+            )
+            bsize, emb_size, tsize = x.size()
+            #print (bsize, esize, tsize)
+            if self.drop_whole_channels:
+                batch_mask = torch.full(size=(bsize, emb_size), fill_value=1.0, device=x.device)
+                probs = torch.full(size=(bsize, self.dropped_dimsize),
+                                  fill_value=1.-self.p)
+                b = Binomial(total_count=1, probs=probs)
+                mask = b.sample()
+                mask = mask.to(x.device)
+                batch_mask[:,self.dindexes] *= (mask * self.p_scale)
+                #print ('mask dc', mask)
+                #print ('maks dcv', mask.view(bsize, self.dropped_dimsize, -1))
+                #x[:,self.dindexes,:] = x[:,self.dindexes,:].clone() * self.p_scale\
+                #                         * mask.view(bsize, self.dropped_dimsize, -1)
+                x = x * batch_mask.view(bsize, emb_size, -1)
+            else:
+                batch_mask = torch.ones_like(x, device=x.device)
+                probs = torch.full(size=(bsize, self.dropped_dimsize, tsize), 
+                                 fill_value=1.-self.p)
+                b = Binomial(total_count=1, probs=probs)
+                mask = b.sample()
+                mask = mask.to(x.device)
+                batch_mask[:,self.dindexes,:] *= (mask * self.p_scale)
+                x = x * batch_mask
+                #xx = x.data.clone()
+                #x[:,self.dindexes,:] = x[:,self.dindexes,:].clone() * mask * self.p_scale
+            return x
+        else:
+            return F.dropout(x, p=self.p, training=self.training)
+
+class MLPBlock(NeuralBlock):
+
+    def __init__(self, ninp, fmaps, din=0, dout=0, context=1, 
+                 tie_context_weights=False, name='MLPBlock',
+                 ratio_fixed=None, range_fixed=None, 
+                 dropin_mode='std', drop_channels=False, emb_size=100):
+        super().__init__(name=name)
+        self.ninp = ninp
+        self.fmaps = fmaps
+        self.tie_context_weights = tie_context_weights
+        assert context % 2 != 0, context
+        if tie_context_weights:
+            self.W = nn.Conv1d(ninp, fmaps, 1)
+            self.pool = nn.AvgPool1d(kernel_size=context, stride=1,
+                                      padding=context//2, count_include_pad=False)
+        else:
+            self.W = nn.Conv1d(ninp, fmaps, context, padding=context//2)
+
+        self.din = PatternedDropout(emb_size=emb_size, p=din, 
+                                    dropout_mode=dropin_mode,
+                                    range_fixed=range_fixed,
+                                    ratio_fixed=ratio_fixed,
+                                    drop_whole_channels=drop_channels)
+        self.act = nn.PReLU(fmaps)
+        self.dout = nn.Dropout(dout)
+
+    def forward(self, x, device=None):
+        if self.tie_context_weights:
+            return self.dout(self.act(self.pool(self.W(self.din(x)))))
+        return self.dout(self.act(self.W(self.din(x))))
+
 class GDeconv1DBlock(NeuralBlock):
 
     def __init__(self, ninp, fmaps,
@@ -352,7 +579,8 @@ class GDeconv1DBlock(NeuralBlock):
 
     def forward(self, x):
         h = self.deconv(x)
-        if self.kwidth % 2 != 0 and self.stride < self.kwidth:
+        if (self.stride % 2 != 0 and self.kwidth % 2 == 0) or \
+           (self.stride % 2 == 0 and self.kwidth % 2 != 0): # and self.stride > self.kwidth:
             h = h[:, :, :-1]
         h = forward_norm(h, self.norm)
         h = forward_activation(self.act, h)
@@ -395,15 +623,18 @@ class ResBasicBlock1D(NeuralBlock):
         out = self.relu(out)
         return out
 
-class ResARModule(NeuralBlock):
+class ResDilatedModule(NeuralBlock):
 
     def __init__(self, ninp, fmaps,
                  res_fmaps,
                  kwidth, dilation,
                  norm_type=None,
                  act=None,
-                 name='ResARModule'):
+                 causal=False,
+                 name='ResDilatedModule'):
         super().__init__(name=name)
+        assert kwidth % 2 != 0
+        self.causal = causal
         self.dil_conv = nn.Conv1d(ninp, fmaps,
                                   kwidth, dilation=dilation)
         if act is not None:
@@ -426,10 +657,15 @@ class ResARModule(NeuralBlock):
                                                   res_fmaps)
 
     def forward(self, x):
-        kw__1 = self.kwidth - 1
-        P = kw__1 + kw__1 * (self.dilation - 1)
-        # causal padding
-        x_p = F.pad(x, (P, 0))
+        if self.causal:
+            kw__1 = self.kwidth - 1
+            P = kw__1 + kw__1 * (self.dilation - 1)
+            # causal padding
+            x_p = F.pad(x, (P, 0))
+        else:
+            kw_2 = self.kwidth // 2
+            P = kw_2 * self.dilation
+            x_p = F.pad(x, (P, P))
         # dilated conv
         h = self.dil_conv(x_p)
         # normalization if applies
@@ -699,10 +935,11 @@ class FeResBlock(NeuralBlock):
 
     def __init__(self, num_inputs,
                  fmaps, kwidth, 
-                 dilation,
-                 pad_mode='reflect',
+                 dilations=[1, 2],
+                 downsample=1,
+                 pad_mode='constant',
                  act=None,
-                 norm_type='bnorm',
+                 norm_type=None,
                  name='FeResBlock'):
         super().__init__(name=name)
         if act is not None and act == 'glu':
@@ -712,35 +949,39 @@ class FeResBlock(NeuralBlock):
         self.num_inputs = num_inputs
         self.fmaps = fmaps
         self.kwidth = kwidth
+        downscale = 1. / downsample
+        self.downscale = downscale
         # stride is ignored for no downsampling is
         # possible in FeResBlock
         self.stride = 1
-        self.dilation = dilation
-        self.pad_mode = pad_mode
+        #self.dilation = dilation
+        dilation = dilations[0]
         self.conv1 = nn.Conv1d(num_inputs,
                                Wfmaps, kwidth,
-                               stride=1,
-                               dilation=dilation)
+                               dilation=dilation,
+                               padding=get_padding(kwidth, dilation))
         self.norm1 = build_norm_layer(norm_type,
                                       self.conv1,
                                       fmaps)
-        assert self.norm1 is not None
+        #assert self.norm1 is not None
         self.act1 = build_activation(act, fmaps)
+        dilation = dilations[1]
         self.conv2 = nn.Conv1d(fmaps, Wfmaps,
-                               kwidth, stride=1,
-                               dilation=dilation)
+                               kwidth,
+                               dilation=dilation,
+                               padding=get_padding(kwidth, dilation))
         self.norm2 = build_norm_layer(norm_type,
                                       self.conv2,
                                       fmaps)
-        assert self.norm2 is not None
+        #assert self.norm2 is not None
         self.act2 = build_activation(act, fmaps)
         if self.num_inputs != self.fmaps:
             # build projection layer
             self.resproj = nn.Conv1d(self.num_inputs,
-                                     self.fmaps, 1,
-                                     bias=False)
+                                     self.fmaps, 1)
 
     def forward(self, x):
+        """
         # compute pad factor
         if self.kwidth % 2 == 0:
             if self.dilation > 1:
@@ -751,19 +992,23 @@ class FeResBlock(NeuralBlock):
             pad = (self.kwidth // 2) * (self.dilation - 1) + \
                     (self.kwidth // 2)
             P = (pad, pad)
+        """
         identity = x
-        x = F.pad(x, P, mode=self.pad_mode)
-        h = self.conv1(x)
-        h = forward_activation(self.act1, h)
-        h = forward_norm(h, self.norm1)
-        h = F.pad(h, P, mode=self.pad_mode)
-        h = self.conv2(h)
-        h = forward_activation(self.act2, h)
+        #x = F.pad(x, P, mode=self.pad_mode)
+        if self.downscale < 1:
+            x = F.interpolate(x, scale_factor=self.downscale)
+        x = self.conv1(x)
+        x = forward_norm(x, self.norm1)
+        x = forward_activation(self.act1, x)
+        x = self.conv2(x)
+        x = forward_activation(self.act2, x)
         if hasattr(self, 'resproj'):
             identity = self.resproj(identity)
-        h = h + identity
-        h = forward_norm(h, self.norm2)
-        return h
+        if self.downscale < 1:
+            identity = F.interpolate(identity, scale_factor=self.downscale)
+        x = x + identity
+        x = forward_norm(x, self.norm2)
+        return x
 
 class FeBlock(NeuralBlock):
 
@@ -900,21 +1145,100 @@ class VQEMA(nn.Module):
         PP = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
         return loss, Q.permute(0, 2, 1).contiguous(), PP, enc
 
-def build_rnn_block(in_size, rnn_size, rnn_layers, rnn_type,
-                    bidirectional=True,
-                    dropout=0):
-    if (rnn_type.lower() == 'qrnn') and QRNN is not None:
-        if bidirectional:
-            print('WARNING: QRNN ignores bidirectional flag')
-            rnn_size = 2 * rnn_size
-        rnn = QRNN(in_size, rnn_size, rnn_layers, dropout=dropout, window=2)
-    elif rnn_type.lower() == 'lstm' or rnn_type.lower() == 'gru':
-        rnn = getattr(nn, rnn_type.upper())(in_size, rnn_size, rnn_layers,
-                                            dropout=dropout,
-                                            bidirectional=bidirectional)
-    else:
-        raise TypeError('Unrecognized rnn type: ', rnn_type)
-    return rnn
+class SimpleResBlock1D(nn.Module):
+    """ Based on WaveRNN a publicly available WaveRNN implementation:
+        https://github.com/fatchord/WaveRNN/blob/master/models/fatchord_version.py
+    """
+
+    def __init__(self, dims):
+        super().__init__()
+        self.conv1 = nn.Conv1d(dims, dims, kernel_size=1, bias=False)
+        self.conv2 = nn.Conv1d(dims, dims, kernel_size=1, bias=False)
+        self.batch_norm1 = nn.BatchNorm1d(dims)
+        self.batch_norm2 = nn.BatchNorm1d(dims)
+
+    def forward(self, x):
+        residual = x
+        x = self.conv1(x)
+        x = self.batch_norm1(x)
+        x = F.relu(x)
+        x = self.conv2(x)
+        x = self.batch_norm2(x)
+        return x + residual
+
+
+class MelResNet(nn.Module):
+    """ Based on WaveRNN a publicly available WaveRNN implementation:
+        https://github.com/fatchord/WaveRNN/blob/master/models/fatchord_version.py
+    """
+
+    def __init__(self, res_blocks, in_dims, compute_dims, res_out_dims, pad):
+        super().__init__()
+        k_size = pad * 2 + 1
+        self.conv_in = nn.Conv1d(in_dims, compute_dims, kernel_size=k_size, bias=False)
+        self.batch_norm = nn.BatchNorm1d(compute_dims)
+        self.layers = nn.ModuleList()
+        for i in range(res_blocks):
+            self.layers.append(SimpleResBlock1D(compute_dims))
+        self.conv_out = nn.Conv1d(compute_dims, res_out_dims, kernel_size=1)
+
+    def forward(self, x):
+        x = self.conv_in(x)
+        x = self.batch_norm(x)
+        x = F.relu(x)
+        for f in self.layers: x = f(x)
+        x = self.conv_out(x)
+        return x
+
+class Stretch2d(nn.Module):
+    """ Based on WaveRNN a publicly available WaveRNN implementation:
+        https://github.com/fatchord/WaveRNN/blob/master/models/fatchord_version.py
+    """
+
+    def __init__(self, x_scale, y_scale):
+        super().__init__()
+        self.x_scale = x_scale
+        self.y_scale = y_scale
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        x = x.unsqueeze(-1).unsqueeze(3)
+        # y_scale is feat dim, x_scale is time
+        x = x.repeat(1, 1, 1, self.y_scale, 1, self.x_scale)
+        return x.view(b, c, h * self.y_scale, w * self.x_scale)
+
+class UpsampleNetwork(nn.Module):
+    """ Based on WaveRNN a publicly available WaveRNN implementation:
+        https://github.com/fatchord/WaveRNN/blob/master/models/fatchord_version.py
+    """
+
+    def __init__(self, feat_dims, upsample_scales=[4, 4, 10], compute_dims=128,
+                 res_blocks=10, res_out_dims=128, pad=2):
+        super().__init__()
+        self.num_outputs = res_out_dims
+        total_scale = np.cumproduct(upsample_scales)[-1]
+        self.indent = pad * total_scale
+        self.resnet = MelResNet(res_blocks, feat_dims, compute_dims, res_out_dims, pad)
+        self.resnet_stretch = Stretch2d(total_scale, 1)
+        self.up_layers = nn.ModuleList()
+        for scale in upsample_scales:
+            k_size = (1, scale * 2 + 1)
+            padding = (0, scale)
+            stretch = Stretch2d(scale, 1)
+            conv = nn.Conv2d(1, 1, kernel_size=k_size, padding=padding, bias=False)
+            conv.weight.data.fill_(1. / k_size[1])
+            self.up_layers.append(stretch)
+            self.up_layers.append(conv)
+
+    def forward(self, m):
+        aux = self.resnet(m).unsqueeze(1)
+        aux = self.resnet_stretch(aux)
+        aux = aux.squeeze(1)
+        m = m.unsqueeze(1)
+        for f in self.up_layers: m = f(m)
+        m = m.squeeze(1)[:, :, self.indent:-self.indent]
+        return m.transpose(1, 2), aux.transpose(1, 2)
+
 
 
 if __name__ == '__main__':
@@ -977,11 +1301,17 @@ if __name__ == '__main__':
 #                         padding='SAME',
 #                         stride=160)
     #conv = GConv1DBlock(1, 10, 21, 1)
-    conv = FeResBlock(1, 10, 3, 1, 1)
-    x = torch.randn(1, 1, 10)
-    print(conv)
-    y = conv(x)
-    print(y.size())
+    #conv = FeResBlock(1, 10, 3, 1, 1)
+    #conv = ResDilatedModule(1, 50, 256, 3, 1024)
+    #x = torch.randn(1, 1, 16000)
+    #print(conv)
+    #y, res = conv(x)
+    #print(y.size())
+    upnet = UpsampleNetwork(100, [4, 4, 10], 256, 10, 100, 2)
+    print(upnet)
+    x = torch.randn(1, 100, 200)
+    z, y = upnet(x)
+    print(x.shape, z.shape, y.shape)
 
 
 
