@@ -1,7 +1,7 @@
 #
 # To run a TIMIT experiment, go to the ASR folder and execute the following command:
 #
-# python run_TIMIT_full_decoding.py $pase_cfg $pase_model $timit_folder $out_folder cfg/MLP_PASE.cfg  cfg/decoder.cfg
+# python run_TIMIT_full_decoding.py ../cfg/frontend/PASE+.cfg ../FE_e199.ckpt $SLURM_TMPDIR/TIMIT/ TIMIT_asr_exp cfg/MLP_PASE.cfg cfg/decoder.cfg 
 #
 
 
@@ -21,6 +21,8 @@ import json
 from data_io import write_mat, open_or_fd
 from utils import run_shell
 
+import warnings
+warnings.filterwarnings("ignore")
 
 def get_freer_gpu(trials=10):
     for j in range(trials):
@@ -37,14 +39,17 @@ def get_freer_gpu(trials=10):
             exit(1)
 
 # Reading inputs
-pase_cfg = sys.argv[1]  # e.g, '../cfg/PASE.cfg'
-pase_model = sys.argv[2]  # e.g, '../PASE.ckpt'
+pase_cfg = sys.argv[1]  # e.g, '../cfg/frontend/PASE+.cfg'
+pase_model = sys.argv[2]  # e.g, '../FE_e199.ckp' (download the pre-trained PASE+ model as described in the doc)
 data_folder = sys.argv[3]  # e.g., '/home/mirco/Dataset/TIMIT'
-output_folder = sys.argv[4]  # e.g., 'TIMIT_asr_exp.res'
+output_folder = sys.argv[4]  # e.g., 'TIMIT_asr_exp'
 cfg_file = sys.argv[5]  # e.g, cfg/MLP_pase.cfg
 cfg_dec = sys.argv[6]  # e.g., cfg/decoder.cfg
 
 skip_training = False
+
+# using absolute path for output folder
+output_folder=os.path.abspath(output_folder)
 
 count_file = output_folder+'/count.npy'
 ASR_model_file = output_folder+'/model.pkl'  # e.g., TIMIT_matconv_512/model.pkl
@@ -78,8 +83,8 @@ if not(skip_training):
     batch_size = int(cfg['batch_size'])
     halving_factor = float(cfg['halving_factor'])
     lr = float(cfg['lr'])
-    left = int(cfg['left'])
-    right = int(cfg['right'])
+    left = int(cfg['left']) # Reduce this to minimize memory (but it has an effect on performance too)
+    right = int(cfg['right']) # Reduce this to minimize memory (but it has an effect on performance too)
     avg_spk = bool(cfg['avg_spk'])
     dnn_lay = cfg['dnn_lay']
     dnn_drop = cfg['dnn_drop']
